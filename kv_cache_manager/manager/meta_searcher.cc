@@ -1581,11 +1581,12 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
 }
 
 ErrorCode MetaSearcher::PrefixMatchWithMamba(RequestContext *request_context,
-                                            const KeyVector &keys,
-                                            const BlockMask &input_mask,
-                                            const std::vector<LocationSpecGroup> &location_spec_groups,
-                                            CacheLocationVector &out_locations,
-                                            SelectLocationPolicy *policy) const {
+                                             const KeyVector &keys,
+                                             const BlockMask &input_mask,
+                                             const std::vector<LocationSpecGroup> &location_spec_groups,
+                                             CacheLocationVector &out_locations,
+                                             SelectLocationPolicy *policy,
+                                             bool use_eagle_pop) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     out_locations.clear();
@@ -1613,7 +1614,6 @@ ErrorCode MetaSearcher::PrefixMatchWithMamba(RequestContext *request_context,
 
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
-    size_t reusable_count = 0;
     for (size_t i = 0; i < query_keys.size(); ++i) {
         if (result.error_codes[i] != EC_OK) {
             if (result.error_codes[i] != EC_NOENT) {
@@ -1632,14 +1632,7 @@ ErrorCode MetaSearcher::PrefixMatchWithMamba(RequestContext *request_context,
         if (location->location_specs().empty()) {
             break;
         }
-        std::set<std::string> present_specs;
-        for (const auto &spec : location->location_specs()) {
-            present_specs.insert(spec.name());
-        }
         out_locations.push_back(std::move(location));
-        if (HasAllLocationSpecGroups(present_specs, state_groups)) {
-            reusable_count = i + 1;
-        }
     }
     if (!prune_keys.empty() && submit_del_req_func_) {
         submit_del_req_func_(prune_keys, prune_loc_ids_vec, {}, false);
@@ -1648,9 +1641,21 @@ ErrorCode MetaSearcher::PrefixMatchWithMamba(RequestContext *request_context,
         out_locations.clear();
         return ec;
     }
-    // FULL payload is needed throughout the prefix; LINEAR state is required
-    // only at the final reusable boundary. Do not count trailing FULL-only keys.
-    out_locations.resize(reusable_count);
+    // Apply EaglePop to the FULL prefix before selecting the last complete
+    // LINEAR state boundary, matching ComputeMambaPrefixMatchBlocks.
+    if (use_eagle_pop && !out_locations.empty()) {
+        out_locations.pop_back();
+    }
+    while (!out_locations.empty()) {
+        std::set<std::string> present_specs;
+        for (const auto &spec : out_locations.back()->location_specs()) {
+            present_specs.insert(spec.name());
+        }
+        if (HasAllLocationSpecGroups(present_specs, state_groups)) {
+            break;
+        }
+        out_locations.pop_back();
+    }
     return EC_OK;
 }
 

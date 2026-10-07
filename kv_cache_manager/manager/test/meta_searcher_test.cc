@@ -5149,6 +5149,73 @@ TEST_F(MetaSearcherTest, MambaLocationQueryRequiresAllFullSpecsAndTheLastComplet
     EXPECT_EQ(1u, locations.size());
 }
 
+TEST_F(MetaSearcherTest, MambaLocationQueryAppliesEaglePopBeforeSelectingStateBoundary) {
+    const MetaSearcher::KeyVector keys{96001, 96002, 96003, 96004, 96005};
+    const std::vector<LocationSpecGroup> groups{{"F0", {"full"}}, {"L0", {"state"}}};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<LocationSpec> specs;
+        if (i < 4) {
+            specs.emplace_back("full", "file://nfs/full_" + std::to_string(keys[i]) + "?size=16");
+        }
+        if (i == 1 || i == 3 || i == 4) {
+            specs.emplace_back("state", "file://nfs/state_" + std::to_string(keys[i]) + "?size=16");
+        }
+        tasks[i].push_back({"nfs_location",
+                            DataStorageType::DATA_STORAGE_TYPE_NFS,
+                            CacheLocationStatus::CLS_SERVING,
+                            std::move(specs)});
+    }
+    std::vector<ErrorCode> errors;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, errors));
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), errors);
+
+    struct Case {
+        const char *name;
+        MetaSearcher::KeyVector query_keys;
+        size_t mask_offset;
+        size_t expected_without_pop;
+        size_t expected_with_pop;
+    };
+    const std::vector<Case> cases{
+        {"sparse_state_boundaries", {keys[0], keys[1], keys[2], keys[3]}, 0, 4, 2},
+        {"trailing_full_only", {keys[0], keys[1], keys[2]}, 0, 2, 2},
+        {"single_complete_block", {keys[1]}, 0, 1, 0},
+        {"no_state_boundary", {keys[0]}, 0, 0, 0},
+        {"full_prefix_gap", {keys[0], keys[1], keys[4], keys[3]}, 0, 2, 0},
+        {"cache_miss", {96999}, 0, 0, 0},
+        {"masked_prefix", {keys[0], keys[1], keys[2], keys[3]}, 1, 3, 1},
+        {"all_masked", {keys[0], keys[1], keys[2], keys[3]}, 4, 0, 0},
+        {"empty_query", {}, 0, 0, 0},
+    };
+    for (const auto &test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        for (bool use_eagle_pop : {false, true}) {
+            SCOPED_TRACE(use_eagle_pop);
+            CacheLocationVector locations{std::make_shared<CacheLocation>()};
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchWithMamba(request_context_.get(),
+                                                           test_case.query_keys,
+                                                           BlockMaskOffset{test_case.mask_offset},
+                                                           groups,
+                                                           locations,
+                                                           &policy_,
+                                                           use_eagle_pop));
+            const size_t expected = use_eagle_pop ? test_case.expected_with_pop : test_case.expected_without_pop;
+            ASSERT_EQ(expected, locations.size());
+            if (!locations.empty()) {
+                const auto &specs = locations.back()->location_specs();
+                ASSERT_EQ(2u, specs.size());
+                auto state =
+                    std::find_if(specs.begin(), specs.end(), [](const auto &spec) { return spec.name() == "state"; });
+                ASSERT_NE(specs.end(), state);
+                const auto boundary_key = test_case.query_keys[test_case.mask_offset + expected - 1];
+                EXPECT_EQ("file://nfs/state_" + std::to_string(boundary_key) + "?size=16", state->uri());
+            }
+        }
+    }
+}
+
 TEST_F(MetaSearcherTest, MambaLocationQuerySelectsCompleteBackendCoverage) {
     class PreferNfsPolicy final : public StaticWeightSLPolicy {
     public:

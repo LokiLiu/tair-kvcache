@@ -92,7 +92,8 @@ public:
                                    const BlockMask &input_mask,
                                    const std::vector<LocationSpecGroup> &location_spec_groups,
                                    CacheLocationVector &out_locations,
-                                   SelectLocationPolicy *policy) const;
+                                   SelectLocationPolicy *policy,
+                                   bool use_eagle_pop = false) const;
     ErrorCode BatchGetBestLocation(RequestContext *request_context,
                                    const KeyVector &keys,
                                    CacheLocationVector &out_locations,

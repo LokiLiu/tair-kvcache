@@ -2847,6 +2847,58 @@ TEST_F(CacheManagerTest, TestGetCacheLocationLen) {
     }
 }
 
+TEST_F(CacheManagerTest, TestMambaLocationQueriesHonorInstanceEaglePop) {
+    const CacheManager::KeyVector keys{1, 2, 3, 4};
+    const std::vector<LocationSpecInfo> spec_infos{{"full", 16}, {"state", 16}};
+    const std::vector<LocationSpecGroup> groups{{"F0", {"full"}}, {"L0", {"state"}}};
+    for (bool use_eagle_pop : {false, true}) {
+        SCOPED_TRACE(use_eagle_pop);
+        const std::string instance_id = use_eagle_pop ? "mamba_eagle_pop" : "mamba_default";
+        auto deployment = use_eagle_pop ? createModelDeploymentWithEaglePop() : createModelDeployment();
+        ASSERT_EQ(EC_OK,
+                  cache_manager_
+                      ->RegisterInstance(request_context_.get(),
+                                         "default",
+                                         instance_id,
+                                         64,
+                                         spec_infos,
+                                         deployment,
+                                         groups,
+                                         CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA)
+                      .first);
+        auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+        ASSERT_NE(nullptr, searcher);
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std::vector<LocationSpec> specs{{"full", "dummy://hot_01/full_" + std::to_string(i) + "?size=16"}};
+            if (i == 1 || i == 3) {
+                specs.emplace_back("state", "dummy://hot_01/state_" + std::to_string(i) + "?size=16");
+            }
+            tasks[i].push_back({"dummy_location",
+                                DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                CacheLocationStatus::CLS_SERVING,
+                                std::move(specs)});
+        }
+        std::vector<ErrorCode> errors;
+        ASSERT_EQ(EC_OK, searcher->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, errors));
+        ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), errors);
+
+        for (auto query_type :
+             {CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA, CacheManager::QueryType::QT_UNSPECIFIED}) {
+            SCOPED_TRACE(static_cast<int>(query_type));
+            auto [location_ec, locations] = cache_manager_->GetCacheLocation(
+                request_context_.get(), instance_id, query_type, keys, {}, BlockMaskOffset{0}, 0, {});
+            ASSERT_EQ(EC_OK, location_ec);
+            const size_t expected = use_eagle_pop ? 2 : 4;
+            ASSERT_EQ(expected, locations.cache_locations_view().size());
+            auto [length_ec, length] =
+                cache_manager_->GetCacheLocationLen(request_context_.get(), instance_id, query_type, keys, {}, 0);
+            ASSERT_EQ(EC_OK, length_ec);
+            EXPECT_EQ(static_cast<int64_t>(expected), length);
+        }
+    }
+}
+
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullRegistryManager) {
     auto saved = cache_manager_->registry_manager_;
     cache_manager_->registry_manager_ = nullptr;

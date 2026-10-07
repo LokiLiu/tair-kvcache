@@ -4377,8 +4377,13 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
         if (!info) {
             return EC_INSTANCE_NOT_EXIST;
         }
-        ec = meta_searcher->PrefixMatchWithMamba(
-            request_context, keys, block_mask, info->location_spec_groups(), cache_locations, policy.get());
+        ec = meta_searcher->PrefixMatchWithMamba(request_context,
+                                                 keys,
+                                                 block_mask,
+                                                 info->location_spec_groups(),
+                                                 cache_locations,
+                                                 policy.get(),
+                                                 info->model_deployment().use_eagle_pop());
         break;
     }
     case QueryType::QT_REVERSE_ROLL_SW_MATCH: {
