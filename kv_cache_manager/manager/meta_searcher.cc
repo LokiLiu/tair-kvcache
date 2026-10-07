@@ -189,12 +189,19 @@ void MergeLocationSpecsByName(std::vector<LocationSpec> &merged_specs,
     });
 }
 
+bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
+                              const std::vector<const LocationSpecGroup *> &groups);
+
 CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
                                              CacheLocationMap &location_map,
                                              CheckLocDataExistFunc check_loc_data_exist,
-                                             std::vector<std::string> &out_prune_loc_ids) {
+                                             std::vector<std::string> &out_prune_loc_ids,
+                                             const std::vector<const LocationSpecGroup *> &full_groups = {},
+                                             const std::vector<const LocationSpecGroup *> &state_groups = {}) {
     // Filter valid locations into a shared map.
     CacheLocationMap valid_map;
+    CacheLocationConstPtr winner;
+    std::vector<std::string> unused_prune_ids;
     for (auto &[id, loc_ptr] : location_map) {
         if (!loc_ptr) {
             continue;
@@ -210,14 +217,44 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
         }
         valid_map.try_emplace(id, loc_ptr);
     }
+    if (!full_groups.empty()) {
+        CacheLocationMap full_candidates;
+        CacheLocationMap state_candidates;
+        for (const auto &[id, location] : valid_map) {
+            std::set<std::string> specs;
+            for (const auto &[peer_id, peer] : valid_map) {
+                if (!policy->IsSameDataStorage(*location, *peer)) {
+                    continue;
+                }
+                for (const auto &spec : peer->location_specs()) {
+                    if (!spec.uri().empty()) {
+                        specs.insert(spec.name());
+                    }
+                }
+            }
+            if (HasAllLocationSpecGroups(specs, full_groups)) {
+                full_candidates.emplace(id, location);
+                if (HasAllLocationSpecGroups(specs, state_groups)) {
+                    state_candidates.emplace(id, location);
+                }
+            }
+        }
+        // Prefer a complete state boundary when available, but allow FULL-only
+        // interior blocks. Never combine specs from different storage instances.
+        if (!state_candidates.empty()) {
+            winner = policy->SelectForMatch(state_candidates, nullptr, unused_prune_ids);
+        }
+        valid_map = std::move(full_candidates);
+    }
     if (valid_map.empty()) {
         return std::make_shared<CacheLocation>();
     }
 
     // Use the policy to select one winning location, which determines the
     // target storage backend instance.
-    std::vector<std::string> unused_prune_ids;
-    CacheLocationConstPtr winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
+    if (!winner || winner->location_specs().empty()) {
+        winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
+    }
     if (!winner || winner->location_specs().empty()) {
         return std::make_shared<CacheLocation>();
     }
@@ -230,6 +267,9 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
             continue;
         }
         for (const auto &spec : loc_ptr->location_specs()) {
+            if (!full_groups.empty() && spec.uri().empty()) {
+                continue;
+            }
             merged_specs.try_emplace(spec.name(), spec);
         }
     }
@@ -731,9 +771,6 @@ void BuildHostSpecNamesForOneKey(const LocationRange &locations,
             }
         });
 }
-
-bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
-                              const std::vector<const LocationSpecGroup *> &groups);
 
 V6DPeerSelection SelectP2PByPrefix(const std::string &target_host,
                                    const KeyToHostSpecNames &local_specs,
@@ -1512,30 +1549,67 @@ ErrorCode MetaSearcher::PrefixMatchWithMamba(RequestContext *request_context,
                                             const std::vector<LocationSpecGroup> &location_spec_groups,
                                             CacheLocationVector &out_locations,
                                             SelectLocationPolicy *policy) const {
+    assert(policy != nullptr);
+    SPAN_TRACER(request_context);
+    out_locations.clear();
     std::vector<const LocationSpecGroup *> full_groups;
     std::vector<const LocationSpecGroup *> state_groups;
     auto ec = ClassifySpecGroups(request_context, location_spec_groups, full_groups, state_groups);
     if (ec != EC_OK) {
         return ec;
     }
-    ec = PrefixMatch(request_context, keys, input_mask, out_locations, policy);
-    if (ec != EC_OK) {
-        return ec;
-    }
-    size_t reusable_count = 0;
-    for (size_t i = 0; i < out_locations.size(); ++i) {
-        std::set<std::string> present_specs;
-        for (const auto &spec : out_locations[i]->location_specs()) {
-            if (!spec.uri().empty()) {
-                present_specs.insert(spec.name());
-            }
+    KeyVector query_keys;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!IsIndexInMaskRange(input_mask, i)) {
+            query_keys.push_back(keys[i]);
         }
-        if (!HasAllLocationSpecGroups(present_specs, full_groups)) {
+    }
+    if (query_keys.empty()) {
+        return EC_OK;
+    }
+
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    CacheLocationMapVector location_maps;
+    auto result = meta_indexer_->GetLocations(request_context, query_keys, location_maps);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
+    size_t reusable_count = 0;
+    for (size_t i = 0; i < query_keys.size(); ++i) {
+        if (result.error_codes[i] != EC_OK) {
+            if (result.error_codes[i] != EC_NOENT) {
+                request_context->error_tracer()->AddErrorMsg("mamba prefix match metadata read failed");
+                ec = result.error_codes[i];
+            }
             break;
         }
+        std::vector<std::string> prune_loc_ids;
+        auto location = SelectAndMergeForMatch(
+            policy, location_maps[i], check_loc_data_exist_func_, prune_loc_ids, full_groups, state_groups);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.push_back(query_keys[i]);
+            prune_loc_ids_vec.push_back(std::move(prune_loc_ids));
+        }
+        if (location->location_specs().empty()) {
+            break;
+        }
+        std::set<std::string> present_specs;
+        for (const auto &spec : location->location_specs()) {
+            present_specs.insert(spec.name());
+        }
+        out_locations.push_back(std::move(location));
         if (HasAllLocationSpecGroups(present_specs, state_groups)) {
             reusable_count = i + 1;
         }
+    }
+    if (!prune_keys.empty() && submit_del_req_func_) {
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec, {}, false);
+    }
+    if (ec != EC_OK) {
+        out_locations.clear();
+        return ec;
     }
     // FULL payload is needed throughout the prefix; LINEAR state is required
     // only at the final reusable boundary. Do not count trailing FULL-only keys.

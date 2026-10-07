@@ -298,6 +298,14 @@ class PrefixReadBackend : public MetaLocalBackend {
 public:
     void SetFailedKey(std::optional<KeyType> key) { failed_key_ = key; }
 
+    std::vector<ErrorCode> GetLocations(RequestContext *request_context,
+                                        const KeyTypeVec &keys,
+                                        CacheLocationMapVector &out_locations) noexcept override {
+        auto results = MetaLocalBackend::GetLocations(request_context, keys, out_locations);
+        InjectFailure(keys.data(), keys.size(), results);
+        return results;
+    }
+
     void ResetReadCounts() {
         location_value_read_count_.store(0, std::memory_order_relaxed);
         compact_read_count_.store(0, std::memory_order_relaxed);
@@ -5138,5 +5146,169 @@ TEST_F(MetaSearcherTest, MambaLocationQueryRequiresAllFullSpecsAndTheLastComplet
     EXPECT_EQ(locations.back()->location_specs().size(), 2u);
     ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchWithMamba(
         request_context_.get(), keys, BlockMaskOffset{1}, groups, locations, &policy));
+    EXPECT_EQ(1u, locations.size());
+}
+
+TEST_F(MetaSearcherTest, MambaLocationQuerySelectsCompleteBackendCoverage) {
+    class PreferNfsPolicy final : public StaticWeightSLPolicy {
+    public:
+        CacheLocationConstPtr SelectForMatch(CacheLocationMap &locations,
+                                             CheckLocDataExistFunc check,
+                                             std::vector<std::string> &prune_ids) const override {
+            // Make the incomplete winner deterministic before coverage filtering.
+            for (const auto &[id, location] : locations) {
+                if (location->type() == DataStorageType::DATA_STORAGE_TYPE_NFS) {
+                    return location;
+                }
+            }
+            return StaticWeightSLPolicy::SelectForMatch(locations, check, prune_ids);
+        }
+    } policy;
+    const MetaSearcher::KeyVector keys{92001, 92002, 92003};
+    const std::vector<LocationSpecGroup> groups{{"F0", {"full_0", "full_1"}}, {"L0", {"state_0", "state_1"}}};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<LocationSpec> nfs_specs{{"full_0", "file://nfs/full_0?size=16"}};
+        if (i != 0) {
+            nfs_specs.emplace_back("full_1", "file://nfs/full_1?size=16");
+        }
+        if (i == 2) {
+            nfs_specs.emplace_back("state_0", "file://nfs/state_0?size=16");
+        }
+        tasks[i].push_back(
+            {"nfs", DataStorageType::DATA_STORAGE_TYPE_NFS, CacheLocationStatus::CLS_SERVING, std::move(nfs_specs)});
+        std::vector<LocationSpec> first{{"full_0", "file://tair/full_0?size=16"}};
+        std::vector<LocationSpec> second{{"full_1", "file://tair/full_1?size=16"}};
+        if (i == 1) {
+            first.emplace_back("state_0", "file://tair/state_0?size=16");
+            second.emplace_back("state_1", "file://tair/state_1?size=16");
+        }
+        tasks[i].push_back({"tair_first",
+                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                            CacheLocationStatus::CLS_SERVING,
+                            std::move(first)});
+        tasks[i].push_back({"tair_second",
+                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                            CacheLocationStatus::CLS_SERVING,
+                            std::move(second)});
+    }
+    std::vector<ErrorCode> errors;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, errors));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), errors);
+
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMamba(
+                  request_context_.get(), keys, BlockMaskOffset{0}, groups, locations, &policy));
+    ASSERT_EQ(2u, locations.size());
+    for (const auto &location : locations) {
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, location->type());
+        for (const auto &spec : location->location_specs()) {
+            EXPECT_FALSE(spec.uri().empty());
+        }
+    }
+    // Interior blocks need only FULL; the final boundary needs every state spec.
+    EXPECT_EQ(2u, locations.front()->location_specs().size());
+    EXPECT_EQ(4u, locations.back()->location_specs().size());
+}
+
+TEST_F(MetaSearcherTest, MambaLocationQueryPreservesDisabledBackendPolicy) {
+    const MetaSearcher::KeyVector keys{92501, 92502};
+    const std::vector<LocationSpecGroup> groups{{"F0", {"full"}}, {"L0", {"state"}}};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<LocationSpec> nfs_specs{{"full", "file://nfs/full?size=16"}};
+        if (i == 1) {
+            nfs_specs.emplace_back("state", "file://nfs/state?size=16");
+        }
+        tasks[i].push_back(
+            {"nfs", DataStorageType::DATA_STORAGE_TYPE_NFS, CacheLocationStatus::CLS_SERVING, std::move(nfs_specs)});
+        tasks[i].push_back({"tair",
+                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                            CacheLocationStatus::CLS_SERVING,
+                            {{"full", "file://tair/full?size=16"}, {"state", "file://tair/state?size=16"}}});
+    }
+    std::vector<ErrorCode> errors;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, errors));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), errors);
+    NamedStorageWeightedSLPolicy policy({{"nfs", 1}, {"tair", 0}});
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMamba(
+                  request_context_.get(), keys, BlockMaskOffset{0}, groups, locations, &policy));
+    ASSERT_EQ(2u, locations.size());
+    EXPECT_EQ(1u, locations.front()->location_specs().size());
+    EXPECT_EQ(2u, locations.back()->location_specs().size());
+    for (const auto &location : locations) {
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, location->type());
+    }
+}
+
+TEST_F(MetaSearcherTest, MambaLocationQueryKeepsStorageInstancesSeparate) {
+    const std::vector<LocationSpecGroup> groups{{"F0", {"full_0", "full_1"}}, {"L0", {"state"}}};
+    for (auto other_type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_NFS}) {
+        SCOPED_TRACE(static_cast<int>(other_type));
+        const MetaSearcher::KeyVector keys{93000 + static_cast<int>(other_type)};
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks{
+            {{"first",
+              DataStorageType::DATA_STORAGE_TYPE_NFS,
+              CacheLocationStatus::CLS_SERVING,
+              {{"full_0", "file://first/full_0?size=16"}, {"state", "file://first/state?size=16"}}},
+             {"second",
+              other_type,
+              CacheLocationStatus::CLS_SERVING,
+              {{"full_1", "file://second/full_1?size=16"}, {"state", "file://second/state?size=16"}}}}};
+        std::vector<ErrorCode> errors;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, errors));
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), errors);
+        CacheLocationVector locations;
+        EXPECT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchWithMamba(
+                      request_context_.get(), keys, BlockMaskOffset{0}, groups, locations, &policy_));
+        EXPECT_TRUE(locations.empty());
+    }
+}
+
+TEST_F(MetaSearcherTest, MambaLocationQueryPropagatesMetadataErrorsAndPreservesMissesAndMasks) {
+    auto *backend = ReplaceWithPrefixReadBackend();
+    ASSERT_NE(nullptr, backend);
+    const MetaSearcher::KeyVector keys{94001, 94002, 94003};
+    const std::vector<LocationSpecGroup> groups{{"F0", {"full"}}, {"L0", {"state"}}};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(
+        keys.size(),
+        {{"nfs",
+          DataStorageType::DATA_STORAGE_TYPE_NFS,
+          CacheLocationStatus::CLS_SERVING,
+          {{"full", "file://nfs/full?size=16"}, {"state", "file://nfs/state?size=16"}}}});
+    std::vector<ErrorCode> errors;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, errors));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), errors);
+
+    CacheLocationVector locations;
+    for (auto failed_key : {keys[0], keys[1]}) {
+        SCOPED_TRACE(failed_key);
+        backend->SetFailedKey(failed_key);
+        locations.push_back(std::make_shared<CacheLocation>());
+        EXPECT_EQ(EC_TIMEOUT,
+                  meta_searcher_->PrefixMatchWithMamba(
+                      request_context_.get(), keys, BlockMaskOffset{0}, groups, locations, &policy_));
+        EXPECT_TRUE(locations.empty());
+    }
+
+    backend->SetFailedKey(keys[0]);
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMamba(
+                  request_context_.get(), keys, BlockMaskOffset{1}, groups, locations, &policy_));
+    EXPECT_EQ(2u, locations.size());
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMamba(
+                  request_context_.get(), keys, BlockMaskOffset{keys.size()}, groups, locations, &policy_));
+    EXPECT_TRUE(locations.empty());
+
+    backend->SetFailedKey(keys[2]);
+    const MetaSearcher::KeyVector with_miss{keys[0], 94999, keys[2]};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMamba(
+                  request_context_.get(), with_miss, BlockMaskOffset{0}, groups, locations, &policy_));
     EXPECT_EQ(1u, locations.size());
 }
