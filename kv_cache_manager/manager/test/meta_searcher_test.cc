@@ -5110,3 +5110,33 @@ TEST_F(BatchGetBestLocationByBackendTest, NoLocationsAtAll) {
     ASSERT_EQ(out.size(), 1);
     EXPECT_TRUE(out[0].empty());
 }
+
+TEST_F(MetaSearcherTest, MambaLocationQueryRequiresAllFullSpecsAndTheLastCompleteState) {
+    const MetaSearcher::KeyVector keys{91001, 91002, 91003, 91004};
+    const std::vector<LocationSpecGroup> groups{
+        {"F0", {"full"}}, {"L0", {"state"}}, {"F0L0", {"full", "state"}}};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<LocationSpec> specs;
+        if (i != 3) {
+            specs.emplace_back("full", "file://nfs/full_" + std::to_string(i) + "?size=16");
+        }
+        if (i == 1 || i == 3) {
+            specs.emplace_back("state", "file://nfs/state_" + std::to_string(i) + "?size=16");
+        }
+        tasks[i].push_back({"nfs_location", DataStorageType::DATA_STORAGE_TYPE_NFS,
+                            CacheLocationStatus::CLS_SERVING, std::move(specs)});
+    }
+    std::vector<ErrorCode> errors;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, errors));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK, EC_OK}), errors);
+    StaticWeightSLPolicy policy;
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchWithMamba(
+        request_context_.get(), keys, BlockMaskOffset{0}, groups, locations, &policy));
+    ASSERT_EQ(2u, locations.size());
+    EXPECT_EQ(locations.back()->location_specs().size(), 2u);
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchWithMamba(
+        request_context_.get(), keys, BlockMaskOffset{1}, groups, locations, &policy));
+    EXPECT_EQ(1u, locations.size());
+}

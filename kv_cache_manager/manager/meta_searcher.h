@@ -87,6 +87,12 @@ public:
                           const BlockMask &input_mask,
                           CacheLocationVector &out_locations,
                           SelectLocationPolicy *policy) const;
+    ErrorCode PrefixMatchWithMamba(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   const BlockMask &input_mask,
+                                   const std::vector<LocationSpecGroup> &location_spec_groups,
+                                   CacheLocationVector &out_locations,
+                                   SelectLocationPolicy *policy) const;
     ErrorCode BatchGetBestLocation(RequestContext *request_context,
                                    const KeyVector &keys,
                                    CacheLocationVector &out_locations,

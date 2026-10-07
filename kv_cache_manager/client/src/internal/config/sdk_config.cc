@@ -126,6 +126,7 @@ void NfsSdkConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
 bool SdkWrapperConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "thread_num", thread_num_);
     KVCM_JSON_GET_MACRO(rapid_value, "queue_size", queue_size_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "drain_on_timeout", drain_on_timeout_, false);
     auto sdk_backend_configs_iter = rapid_value.FindMember("sdk_backend_configs");
     if (sdk_backend_configs_iter != rapid_value.MemberEnd() && sdk_backend_configs_iter->value.IsArray()) {
         for (const auto &sdk_val : sdk_backend_configs_iter->value.GetArray()) {
@@ -170,6 +171,7 @@ bool SdkWrapperConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
 void SdkWrapperConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "thread_num", thread_num_);
     Put(writer, "queue_size", queue_size_);
+    Put(writer, "drain_on_timeout", drain_on_timeout_);
     std::vector<const SdkBackendConfig *> sdk_backend_configs;
     sdk_backend_configs.reserve(sdk_backend_configs_map_.size());
     for (const auto &pair : sdk_backend_configs_map_) {
@@ -221,7 +223,7 @@ bool SdkWrapperConfig::operator==(const SdkWrapperConfig &other) const {
     }
 
     return thread_num_ == other.thread_num_ && queue_size_ == other.queue_size_ &&
-           timeout_config_ == other.timeout_config_;
+           timeout_config_ == other.timeout_config_ && drain_on_timeout_ == other.drain_on_timeout_;
 }
 
 bool SdkWrapperConfig::operator!=(const SdkWrapperConfig &other) const { return !(*this == other); }

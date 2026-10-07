@@ -209,6 +209,8 @@ public:
     }
     const SdkTimeoutConfig &timeout_config() const { return timeout_config_; }
 
+    bool drain_on_timeout() const { return drain_on_timeout_; }
+
     void set_thread_num(size_t thread_num) { thread_num_ = thread_num; }
     void set_queue_size(size_t queue_size) { queue_size_ = queue_size; }
     void set_sdk_backend_configs_map(
@@ -216,10 +218,14 @@ public:
         sdk_backend_configs_map_ = sdk_backend_configs_map;
     }
     void set_timeout_config(const SdkTimeoutConfig &timeout_config) { timeout_config_ = timeout_config; }
+    void set_drain_on_timeout(bool value) { drain_on_timeout_ = value; }
 
 private:
     size_t thread_num_{8};
     size_t queue_size_{2000};
+    // Opt in when the caller releases its buffer references on return. The
+    // deadline stops queued work; started work is drained before returning.
+    bool drain_on_timeout_{false};
     // 为什么这里要默认加3个
     std::unordered_map<DataStorageType, std::shared_ptr<SdkBackendConfig>> sdk_backend_configs_map_ = {
         {DataStorageType::DATA_STORAGE_TYPE_HF3FS, std::make_shared<Hf3fsSdkConfig>()},

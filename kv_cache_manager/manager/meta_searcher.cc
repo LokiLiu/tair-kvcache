@@ -919,11 +919,25 @@ ErrorCode ClassifySpecGroups(RequestContext *request_context,
                              std::vector<const LocationSpecGroup *> &mamba_state_groups) {
     full_groups.clear();
     mamba_state_groups.clear();
+    std::set<std::string> state_specs;
+    for (const auto &group : location_spec_groups) {
+        if (!group.name().empty() && group.name().front() == 'L') {
+            state_specs.insert(group.spec_names().begin(), group.spec_names().end());
+        }
+    }
     for (const auto &group : location_spec_groups) {
         const auto &group_name = group.name();
         const char category = group_name.empty() ? '?' : group_name.front();
         switch (category) {
         case 'F':
+            // RTP also registers aggregate write groups such as FfullLstate.
+            // They are not additional FULL components; requiring their state
+            // specs at every key would discard the FULL-only prefix.
+            if (std::any_of(group.spec_names().begin(), group.spec_names().end(), [&](const auto &name) {
+                    return state_specs.count(name) != 0;
+                })) {
+                break;
+            }
             full_groups.push_back(&group);
             break;
         case 'L':
@@ -1489,6 +1503,43 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
     if (ec != EC_OK) {
         KVCM_LOG_DEBUG("PrefixMatchBestLocationImpl failed");
     }
+    return EC_OK;
+}
+
+ErrorCode MetaSearcher::PrefixMatchWithMamba(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            const BlockMask &input_mask,
+                                            const std::vector<LocationSpecGroup> &location_spec_groups,
+                                            CacheLocationVector &out_locations,
+                                            SelectLocationPolicy *policy) const {
+    std::vector<const LocationSpecGroup *> full_groups;
+    std::vector<const LocationSpecGroup *> state_groups;
+    auto ec = ClassifySpecGroups(request_context, location_spec_groups, full_groups, state_groups);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    ec = PrefixMatch(request_context, keys, input_mask, out_locations, policy);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    size_t reusable_count = 0;
+    for (size_t i = 0; i < out_locations.size(); ++i) {
+        std::set<std::string> present_specs;
+        for (const auto &spec : out_locations[i]->location_specs()) {
+            if (!spec.uri().empty()) {
+                present_specs.insert(spec.name());
+            }
+        }
+        if (!HasAllLocationSpecGroups(present_specs, full_groups)) {
+            break;
+        }
+        if (HasAllLocationSpecGroups(present_specs, state_groups)) {
+            reusable_count = i + 1;
+        }
+    }
+    // FULL payload is needed throughout the prefix; LINEAR state is required
+    // only at the final reusable boundary. Do not count trailing FULL-only keys.
+    out_locations.resize(reusable_count);
     return EC_OK;
 }
 

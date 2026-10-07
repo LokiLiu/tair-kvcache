@@ -859,7 +859,12 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "check input or get meta searcher failed");
     if (query_type == QueryType::QT_UNSPECIFIED) {
-        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, CacheLocationViewVecWrapper, "unknown query type");
+        auto info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+        query_type = info ? static_cast<QueryType>(info->default_query_type()) : QueryType::QT_UNSPECIFIED;
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                          query_type == QueryType::QT_UNSPECIFIED ? EC_BADARGS : EC_OK,
+                                          CacheLocationViewVecWrapper,
+                                          "unknown default query type");
     }
     auto query_scope = (query_type == QueryType::QT_BATCH_GET)
                            ? KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerBatchGet)
@@ -894,7 +899,7 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     if (service_metrics_collector) {
         size_t query_count = query_keys.size();
         size_t hit_count = 0;
-        if (query_type == QueryType::QT_PREFIX_MATCH) {
+        if (query_type == QueryType::QT_PREFIX_MATCH || query_type == QueryType::QT_PREFIX_MATCH_WITH_MAMBA) {
             // PrefixMatch only returns matched blocks; size() == hit count
             hit_count = cache_locations.size();
         } else {
@@ -1096,7 +1101,12 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, int64_t, "check input or get meta searcher failed");
     if (query_type == QueryType::QT_UNSPECIFIED) {
-        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, int64_t, "unknown query type");
+        auto info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+        query_type = info ? static_cast<QueryType>(info->default_query_type()) : QueryType::QT_UNSPECIFIED;
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                          query_type == QueryType::QT_UNSPECIFIED ? EC_BADARGS : EC_OK,
+                                          int64_t,
+                                          "unknown default query type");
     }
     CacheLocationVector cache_locations;
     KeyVector query_keys = keys;
@@ -1133,7 +1143,8 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
         }
         break;
     }
-    case QueryType::QT_PREFIX_MATCH: {
+    case QueryType::QT_PREFIX_MATCH:
+    case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
         cache_location_len = static_cast<int64_t>(cache_locations.size());
         break;
     }
@@ -4361,8 +4372,17 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
         ec = meta_searcher->PrefixMatch(request_context, keys, block_mask, cache_locations, policy.get());
         break;
     }
+    case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
+        auto info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+        if (!info) {
+            return EC_INSTANCE_NOT_EXIST;
+        }
+        ec = meta_searcher->PrefixMatchWithMamba(
+            request_context, keys, block_mask, info->location_spec_groups(), cache_locations, policy.get());
+        break;
+    }
     case QueryType::QT_REVERSE_ROLL_SW_MATCH: {
-        if (keys.size() < sw_size || sw_size < 0) {
+        if (sw_size <= 0 || keys.size() < static_cast<size_t>(sw_size)) {
             request_context->error_tracer()->AddErrorMsg("QT_REVERSE_ROLL_SW_MATCH bad args");
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "bad keys size: %zu, %d", keys.size(), sw_size);
         }
@@ -4370,7 +4390,8 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
         break;
     }
     default:
-        assert(false);
+        request_context->error_tracer()->AddErrorMsg("unsupported cache location query type");
+        return EC_BADARGS;
     }
     if (ec == EC_OK && query_type != QueryType::QT_PREFIX_MATCH) {
         auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);

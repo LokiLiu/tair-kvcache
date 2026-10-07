@@ -40,7 +40,7 @@
    取消机制保证其自身 deadline 之后不再触碰 caller buffer。
 2. **ManagerClient / RTPLLMClient 层**：走 TransferClient 的既有路径，自动获得
    wrapper 预算，无额外配置。
-3. **超时路径不等在飞任务；普通错误路径有界等待**：RunWithTimeoutParallel 在
+3. **默认 `drain_on_timeout=false` 的返回行为**：RunWithTimeoutParallel 在
    预算到期时立即返回；在飞任务的 I/O 不被取消（hard 后端的逐块准入会尽快
    停下；soft 后端见 §3）。普通错误路径则不同：错误往往发生在预算之前，SDK 仍在
    契约允许的窗口内写 caller buffer，因此错误路径会先置 stop 拦截仍在排队的
@@ -53,3 +53,14 @@
 5. **Mooncake 为 soft 级**：超时后在飞的 DMA 无法取消；调用方在收到超时后立即
    复用相应 buffer 是文档化的数据竞争。逐 key 准入把暴露面从整批降到 ≤1 个在飞
    key。
+
+## 5. RTP 调用者的引用释放边界
+
+RTP 在 `TransferClient` 返回后释放 block 引用，因此使用新增的
+`sdk_config.drain_on_timeout=true`。外层 deadline 仍用于排队准入；错误、超时以及提交／future 异常路径先阻止排队 I/O，再等待已经提交的任务结束。
+默认 false 保留原有客户端的预算返回策略。true 模式不承诺在外层预算内返回；如果后端卡住，调用者也会继续等待，buffer 引用仍然保留。
+
+真实 PACE 的 `pace_synchronize` 在超时／部分失败时取消并排空对用户 buffer 的访问。
+RTP 仍需等待这次同步调用返回，不能把 PACE 的内部 10 秒当作从 wrapper 入口开始计时的 10 秒。
+RTP 调度/controller rank 持 allocation pin，直到各 peer 的 payload RPC 收尾。Follower 不维护调度 rank 的分配账本，只校验物理 block 范围并保留 backing pool 至本地 SDK 返回；广播期限不能代替远端完成信号。
+`drain_on_timeout=true` 没有额外等待时限；后端持续阻塞时，调用和持有这些任务的 shutdown 也会等待。SDK future 结束只说明后端方法返回，后端仍需保证不再访问调用方 buffer。
