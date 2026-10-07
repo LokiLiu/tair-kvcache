@@ -25,6 +25,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/client/include/common.h"
@@ -169,13 +170,16 @@ protected:
                                 int queue_size,
                                 int put_timeout_ms,
                                 int get_timeout_ms,
-                                const std::string &storage_configs_json) {
+                                const std::string &storage_configs_json,
+                                bool drain_on_timeout = false) {
         init_params_.storage_configs = storage_configs_json;
         // 注入测试 factory（-fno-access-control）：生产代码不含任何测试钩子。
         wrapper.sdk_factory_ = fake_factory_.get();
-        return wrapper.Init(
-            MakeClientConfig(thread_num, queue_size, put_timeout_ms, get_timeout_ms, storage_configs_json),
-            init_params_);
+        auto config = MakeClientConfig(thread_num, queue_size, put_timeout_ms, get_timeout_ms, storage_configs_json);
+        if (drain_on_timeout) {
+            config->sdk_wrapper_config()->set_drain_on_timeout(true);
+        }
+        return wrapper.Init(config, init_params_);
     }
 
     DataStorageUri MakeUri(const std::string &host, const std::string &path_suffix, size_t blkid, size_t size) {
@@ -265,10 +269,8 @@ protected:
 // ============================================================================
 // 3.1 运行中超时（有界返回）
 // ============================================================================
-// 守门测试：防止"无界等待 in-flight I/O"方案复活（docs/design/client_sdk_io_contract.md 否决项）。
-// 超时路径的 drain 只 wait_until(deadline)——deadline 已过则立即返回；若有人把等待改成
-// "等 in-flight 完成后再返回"（无界），fake 睡 3s 而 timeout 只有 200ms，本测试会在
-// 远大于 1.5s 后才返回，断言立刻变红。
+// Default mode must retain bounded returns. Opt-in draining is covered below.
+// A 3s SDK call with a 200ms budget must not make the default mode wait 3s.
 TEST_F(SdkTimeoutContractTest, TestRunningTimeoutBoundedReturn) {
     auto ctrl = std::make_shared<FakeSlowSdkControl>();
     ctrl->get_delay_ms.store(3000); // 慢 fake：睡 3s
@@ -293,6 +295,74 @@ TEST_F(SdkTimeoutContractTest, TestRunningTimeoutBoundedReturn) {
 
     // 等 fake 的 3s 睡眠结束，避免 wrapper 析构 join 池线程时占时长（事件同步，非时序断言）。
     ASSERT_TRUE(WaitFor(ctrl->get_done, 5000));
+}
+
+TEST_F(SdkTimeoutContractTest, TestDrainOnTimeoutWaitsForInFlightAndSkipsQueuedIo) {
+    auto running = std::make_shared<FakeSlowSdkControl>();
+    auto queued = std::make_shared<FakeSlowSdkControl>();
+    std::promise<void> release;
+    running->get_release = release.get_future().share();
+    RegisterFakeForTest("running", running);
+    RegisterFakeForTest("queued", queued);
+
+    SdkWrapper wrapper;
+    ASSERT_EQ(ER_OK, InitWrapper(wrapper, 1, 2000, 1000, 1000, MakeDualFileStorageConfigs("running", "queued"), true));
+    const std::vector<DataStorageUri> uris{MakeUri("running", "r/0", 0, 1024), MakeUri("queued", "q/0", 0, 1024)};
+    auto buffers = TestBuffers::Make(2, 1024);
+    auto result = std::async(std::launch::async, [&] {
+        auto ec = wrapper.Get(uris, buffers.buffers);
+        return std::make_pair(ec, running->get_done.load());
+    });
+
+    const bool started = WaitFor(running->get_started, 5000);
+    // Wait past the wrapper budget while the in-flight SDK call is held open.
+    const auto before_release = result.wait_for(std::chrono::milliseconds(1500));
+    release.set_value();
+    const auto [ec, completed_at_return] = result.get();
+    // Join before assertions so a broken drain cannot outlive the test buffers.
+    wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_TRUE(started);
+    EXPECT_EQ(std::future_status::timeout, before_release);
+    EXPECT_EQ(ER_SDK_TIMEOUT, ec);
+    EXPECT_TRUE(completed_at_return);
+    EXPECT_EQ(1, running->get_call_count.load());
+    EXPECT_EQ(0, queued->get_call_count.load());
+}
+
+TEST_F(SdkTimeoutContractTest, TestDrainOnErrorWaitsForInFlightPastDeadline) {
+    auto failed = std::make_shared<FakeSlowSdkControl>();
+    auto running = std::make_shared<FakeSlowSdkControl>();
+    std::promise<void> release;
+    running->get_release = release.get_future().share();
+    failed->get_result.store(static_cast<int>(ER_SDKREAD_ERROR));
+    failed->gate_on_peer_calls = &running->get_call_count;
+    RegisterFakeForTest("failed", failed);
+    RegisterFakeForTest("running", running);
+
+    SdkWrapper wrapper;
+    ASSERT_EQ(ER_OK, InitWrapper(wrapper, 2, 2000, 1000, 1000, MakeDualFileStorageConfigs("failed", "running"), true));
+    const std::vector<DataStorageUri> uris{MakeUri("failed", "f/0", 0, 1024), MakeUri("running", "r/0", 0, 1024)};
+    auto buffers = TestBuffers::Make(2, 1024);
+    auto result = std::async(std::launch::async, [&] {
+        auto ec = wrapper.Get(uris, buffers.buffers);
+        return std::make_pair(ec, running->get_done.load());
+    });
+
+    const bool started = WaitFor(running->get_started, 5000);
+    const bool failed_before_release = WaitFor(failed->get_done, 5000);
+    const auto before_release = result.wait_for(std::chrono::milliseconds(1500));
+    release.set_value();
+    const auto [ec, completed_at_return] = result.get();
+    wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(failed_before_release);
+    EXPECT_EQ(std::future_status::timeout, before_release);
+    EXPECT_EQ(ER_SDKREAD_ERROR, ec);
+    EXPECT_TRUE(completed_at_return);
+    EXPECT_EQ(1, failed->get_call_count.load());
+    EXPECT_EQ(1, running->get_call_count.load());
 }
 
 // ============================================================================

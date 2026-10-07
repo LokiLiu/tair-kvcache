@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <thread>
 
@@ -48,6 +49,10 @@ struct FakeSlowSdkControl {
     // 用于"错误发生时 peer 已在飞"的编排，消除线程池 pickup 时序竞态（满载机器上
     // pickup 可晚于错误返回，导致 peer 被 stop 拦下、测试断言失效）。
     std::atomic<int> *gate_on_peer_calls{nullptr};
+
+    // Optional test-controlled completion gate for in-flight drain assertions.
+    std::atomic<bool> get_started{false};
+    std::shared_future<void> get_release;
 
     // 事件（原子标志，测试轮询等待；替代"睡 X ms 后断言"的紧耦合时序）。
     std::atomic<bool> get_done{false};     // Get 完全结束（含延迟与违约写入）
@@ -82,6 +87,10 @@ public:
         ctrl_->get_done.store(false);
         ctrl_->write_done.store(false);
         ctrl_->blocks_touched.store(0);
+        ctrl_->get_started.store(true);
+        if (ctrl_->get_release.valid()) {
+            ctrl_->get_release.wait();
+        }
 
         // SdkInterface::Get 的 buffers 是 const 引用，但真实 SDK 本来就要写 caller buffer；
         // 这里 const_cast 只是模拟"后端向 caller buffer 搬运/写入"这一事实行为。

@@ -5312,3 +5312,66 @@ TEST_F(MetaSearcherTest, MambaLocationQueryPropagatesMetadataErrorsAndPreservesM
                   request_context_.get(), with_miss, BlockMaskOffset{0}, groups, locations, &policy_));
     EXPECT_EQ(1u, locations.size());
 }
+
+TEST_F(MetaSearcherTest, MambaQueriesPreserveFullGroupsUnlessTheirAggregateComponentsAreRegistered) {
+    const MetaSearcher::KeyVector keys{95001, 95002, 95003};
+    const std::string host = "group-compat:8080";
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<LocationSpec> specs{{"full", "event_report://" + host + "/mem"},
+                                        {"extra", "event_report://" + host + "/mem"}};
+        if (i != 1) {
+            specs.emplace_back("state", "event_report://" + host + "/mem");
+            specs.emplace_back("state_1", "event_report://" + host + "/mem");
+        }
+        tasks[i].push_back({"kvs#event_report_l1p5#mem#" + host,
+                            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                            CacheLocationStatus::CLS_SERVING,
+                            std::move(specs)});
+    }
+    std::vector<ErrorCode> errors;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, errors));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), errors);
+
+    struct Case {
+        const char *name;
+        std::vector<LocationSpecGroup> groups;
+        size_t expected_prefix;
+    };
+    const std::vector<Case> cases{
+        {"aggregate_without_standalone_full", {{"FfullLstate", {"full", "state"}}, {"Lstate", {"state"}}}, 1},
+        {"overlap_is_not_an_aggregate", {{"F0", {"full"}}, {"Fshared", {"full", "state"}}, {"L0", {"state"}}}, 1},
+        {"compound_name_with_additional_specs",
+         {{"F0", {"full"}}, {"L0", {"state"}}, {"F0L0", {"full", "extra", "state"}}},
+         1},
+        {"registered_full_and_state_aggregate", {{"F0", {"full"}}, {"L0", {"state"}}, {"F0L0", {"full", "state"}}}, 3},
+        {"multiple_full_and_state_components",
+         {{"F0", {"full"}},
+          {"F1", {"extra"}},
+          {"F0F1", {"full", "extra"}},
+          {"L0", {"state"}},
+          {"L1", {"state_1"}},
+          {"F0F1L0L1", {"full", "extra", "state", "state_1"}}},
+         3},
+    };
+    for (const auto &test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        CacheLocationVector locations;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchWithMamba(
+                      request_context_.get(), keys, BlockMaskOffset{0}, test_case.groups, locations, &policy_));
+        EXPECT_EQ(test_case.expected_prefix, locations.size());
+        // Cover both the progressive host query and the P2P-capable query.
+        for (size_t p2p_host_count : {size_t{0}, size_t{1}}) {
+            SCOPED_TRACE(p2p_host_count);
+            std::vector<MetaSearcher::HostCacheMatch> matches;
+            ASSERT_EQ(
+                EC_OK,
+                meta_searcher_->PrefixMatchWithMambaByHost(
+                    request_context_.get(), keys, false, {"mem"}, test_case.groups, matches, nullptr, p2p_host_count));
+            ASSERT_EQ(1u, matches.size());
+            EXPECT_EQ(host, matches.front().host_ip_port);
+            EXPECT_EQ(static_cast<int64_t>(test_case.expected_prefix), matches.front().local);
+        }
+    }
+}

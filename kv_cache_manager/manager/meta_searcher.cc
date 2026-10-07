@@ -962,17 +962,54 @@ ErrorCode ClassifySpecGroups(RequestContext *request_context,
             state_specs.insert(group.spec_names().begin(), group.spec_names().end());
         }
     }
+    auto is_aggregate_write_group = [&](const LocationSpecGroup &group) {
+        // RTP names aggregates by concatenating their registered component names.
+        // Require an exact name and spec union; overlap alone is not sufficient.
+        std::string_view remaining = group.name();
+        std::string_view previous;
+        std::set<std::string> covered_specs;
+        bool has_full = false;
+        bool has_state = false;
+        while (!remaining.empty()) {
+            const LocationSpecGroup *component = nullptr;
+            for (const auto &candidate : location_spec_groups) {
+                const auto &name = candidate.name();
+                const auto &specs = candidate.spec_names();
+                if (&candidate == &group || name.empty() || specs.empty() || std::string_view(name) <= previous ||
+                    remaining.substr(0, name.size()) != name ||
+                    !std::includes(group.spec_names().begin(), group.spec_names().end(), specs.begin(), specs.end())) {
+                    continue;
+                }
+                const bool full =
+                    name.front() == 'F' && std::none_of(specs.begin(), specs.end(), [&](const auto &spec) {
+                        return state_specs.count(spec) != 0;
+                    });
+                if (!full && name.front() != 'L') {
+                    continue;
+                }
+                if (!component || name.size() > component->name().size()) {
+                    component = &candidate;
+                }
+            }
+            if (!component) {
+                return false;
+            }
+            has_full |= component->name().front() == 'F';
+            has_state |= component->name().front() == 'L';
+            covered_specs.insert(component->spec_names().begin(), component->spec_names().end());
+            previous = component->name();
+            remaining.remove_prefix(component->name().size());
+        }
+        return has_full && has_state &&
+               covered_specs == std::set<std::string>(group.spec_names().begin(), group.spec_names().end());
+    };
     for (const auto &group : location_spec_groups) {
         const auto &group_name = group.name();
         const char category = group_name.empty() ? '?' : group_name.front();
         switch (category) {
         case 'F':
-            // RTP also registers aggregate write groups such as FfullLstate.
-            // They are not additional FULL components; requiring their state
-            // specs at every key would discard the FULL-only prefix.
-            if (std::any_of(group.spec_names().begin(), group.spec_names().end(), [&](const auto &name) {
-                    return state_specs.count(name) != 0;
-                })) {
+            // Preserve standalone FULL groups, including legacy overlapping ones.
+            if (is_aggregate_write_group(group)) {
                 break;
             }
             full_groups.push_back(&group);
